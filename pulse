@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# pulse — fixed-grid TUI dashboard (Linux / Termux)
+# bash curl jq awk date ping tput printf
+
+set -euo pipefail
+
+readonly VERSION="2.1.0"
+readonly REFRESH_SEC="${PULSE_INTERVAL:-5}"
+readonly CURL_OPTS=(--silent --show-error --max-time 10 --connect-timeout 5)
+readonly COINBASE_SPOT_URL='https://api.coinbase.com/v2/prices'
+readonly R=$'\033[0m'
+readonly B=$'\033[1m'
+readonly C_TIME=$'\033[32m'
+readonly C_WEATHER=$'\033[34m'
+readonly C_CRYPTO=$'\033[33m'
+readonly C_NET=$'\033[36m'
+readonly C_MARKET=$'\033[35m'
+readonly C_DIM=$'\033[2m'
+
+# Terminal size (0-based rows/cols for tput cup)
+COLS=80 LINES=24
+LW=39 RW=40 RX=40 PH=7
+Y_TOP=0 Y_MID=7 Y_BOT=14 Y_STATUS=22
+
+# Field: row col width (0-based)
+T_MSK_R=0 T_MSK_C=0 T_MSK_W=0
+T_UTC_R=0 T_UTC_C=0 T_UTC_W=0
+T_WX_R=0 T_WX_R2=0 T_WX_C=0 T_WX_W=0
+T_BTC_R=0 T_BTC_C=0 T_BTC_W=0
+T_ETH_R=0 T_ETH_C=0 T_ETH_W=0
+T_RUB_R=0 T_RUB_C=0 T_RUB_W=0
+T_IP_R=0 T_IP_C=0 T_IP_W=0
+T_CF_R=0 T_CF_C=0 T_CF_W=0
+T_GG_R=0 T_GG_C=0 T_GG_W=0
+T_RT_R=0 T_RT_C=0 T_RT_W=0
+T_BM_R=0 T_BM_C=0 T_BM_W=0
+T_EM_R=0 T_EM_C=0 T_EM_W=0
+T_VO_R=0 T_VO_C=0 T_VO_W=0
+T_SP_R=0 T_SP_C=0 T_SP_W=0
+
+DATA_MSK="" DATA_UTC="" DATA_WEATHER=""
+DATA_BTC="" DATA_ETH="" DATA_RUB=""
+DATA_IP="" DATA_PING_CF="" DATA_PING_GG="" DATA_ROUTE_WAVE=""
+DATA_BTC_MOM="" DATA_ETH_MOM="" DATA_VOL="" DATA_SPARK=""
+
+PREV_BTC="" PREV_ETH=""
+VOL_HIST="" SPARK_HIST="" PING_HIST=""
+WEATHER_TS=0 IP_TS=0
+LAST_WEATHER="" LAST_IP=""
+REFRESH_LABEL='5s'
+LOOP_INTERVAL=5
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+require_deps() {
+  local m=()
+  for c in curl jq awk date ping tput; do
+    command -v "$c" >/dev/null 2>&1 || m+=("$c")
+  done
+  if ((${#m[@]} > 0)); then
+    printf 'Need: %s\n' "${m[*]}" >&2
+    exit 1
+  fi
+}
+
+repeat_ch() { printf '%*s' "$1" '' | tr ' ' "${2:--}"; }
+
+truncate_plain() {
+  local s="$1" max="$2"
+  if ((${#s} <= max)); then printf '%s' "$s"; return; fi
+  if ((max < 2)); then printf '%s' "${s:0:max}"; return; fi
+  printf '%s…' "${s:0:max-1}"
+}
+
+cup() { tput cup "$1" "$2" 2>/dev/null || printf '\033[%d;%dH' "$(( $1 + 1 ))" "$(( $2 + 1 ))"; }
+
+put_at() {
+  local row="$1" col="$2" width="$3" text="$4" color="${5:-}"
+  text=$(truncate_plain "$text" "$width")
+  cup "$row" "$col"
+  if [[ -n "$color" ]]; then
+    printf '%b%-*s%b\033[K' "$color" "$width" "$text" "$R"
+  else
+    printf '%-*s\033[K' "$width" "$text"
+  fi
+}
+
+safe_curl() { curl "${CURL_OPTS[@]}" "$@" 2>/dev/null || true; }
+
+# ── layout (0-based, tput cup) ────────────────────────────────────────────────
+init_geometry() {
+  COLS=$(tput cols 2>/dev/null || echo 80)
+  LINES=$(tput lines 2>/dev/null || echo 24)
+  if (( COLS < 80 )); then COLS=80; fi
+  if (( LINES < 24 )); then LINES=24; fi
+
+  LW=$(( (COLS - 1) / 2 ))
+  RW=$(( COLS - 1 - LW ))
+  RX=$(( LW + 1 ))
+  PH=7
+  Y_TOP=0
+  Y_MID=7
+  Y_BOT=14
+  Y_STATUS=$(( LINES >= 24 ? 22 : LINES - 2 ))
+
+  # Content rows = panel_top + 2 .. +5 (below border + title)
+  local pad=3
+  T_MSK_W=$(( LW - pad * 2 )); T_MSK_R=$(( Y_TOP + 2 )); T_MSK_C=$pad
+  T_UTC_W=$T_MSK_W;             T_UTC_R=$(( Y_TOP + 3 )); T_UTC_C=$pad
+
+  T_WX_W=$(( RW - pad * 2 ))
+  T_WX_R=$(( Y_TOP + 2 )); T_WX_R2=$(( Y_TOP + 3 )); T_WX_C=$(( RX + pad ))
+
+  T_BTC_W=$(( LW - pad * 2 ));  T_BTC_R=$(( Y_MID + 2 )); T_BTC_C=$pad
+  T_ETH_W=$T_BTC_W;             T_ETH_R=$(( Y_MID + 3 )); T_ETH_C=$pad
+  T_RUB_W=$T_BTC_W;             T_RUB_R=$(( Y_MID + 4 )); T_RUB_C=$pad
+
+  T_IP_W=$(( RW - pad * 2 ));   T_IP_R=$(( Y_MID + 2 ));  T_IP_C=$(( RX + pad ))
+  T_CF_W=$T_IP_W;               T_CF_R=$(( Y_MID + 3 ));  T_CF_C=$T_IP_C
+  T_GG_W=$T_IP_W;               T_GG_R=$(( Y_MID + 4 ));  T_GG_C=$T_IP_C
+  T_RT_W=$T_IP_W;               T_RT_R=$(( Y_MID + 5 ));  T_RT_C=$T_IP_C
+
+  T_BM_W=$(( COLS - pad * 2 )); T_BM_R=$(( Y_BOT + 2 )); T_BM_C=$pad
+  T_EM_W=$T_BM_W;               T_EM_R=$(( Y_BOT + 3 )); T_EM_C=$pad
+  T_VO_W=$T_BM_W;               T_VO_R=$(( Y_BOT + 4 )); T_VO_C=$pad
+  T_SP_W=$T_BM_W;               T_SP_R=$(( Y_BOT + 5 )); T_SP_C=$pad
+}
+
+# Draw closed box: y,x = top-left, w = outer width, h = outer height
+draw_box() {
+  local y="$1" x="$2" w="$3" h="$4" title="$5" color="$6"
+  local inner=$(( w - 2 )) i
+  title=$(truncate_plain "$title" $(( inner - 2 )))
+
+  cup "$y" "$x"
+  printf '%b+%s+%b' "$color" "$(repeat_ch "$inner")" "$R"
+  cup $((y + 1)) "$x"
+  printf '%b| %-*s |%b' "$color" $(( inner - 2 )) "$title" "$R"
+  for ((i = 2; i < h - 1; i++)); do
+    cup $((y + i)) "$x"
+    printf '%b|%*s|%b' "$color" "$inner" "" "$R"
+  done
+  cup $((y + h - 1)) "$x"
+  printf '%b+%s+%b' "$color" "$(repeat_ch "$inner")" "$R"
+}
+
+draw_gutter() {
+  local y0="$1" r
+  for ((r = y0 + 1; r < y0 + PH - 1; r++)); do
+    cup "$r" "$LW"
+    printf '%b|%b' "$C_DIM" "$R"
+  done
+}
+
+draw_grid_frame() {
+  draw_box "$Y_TOP" 0 "$LW" "$PH" "TIME" "$C_TIME"
+  draw_box "$Y_TOP" "$RX" "$RW" "$PH" "WEATHER" "$C_WEATHER"
+  draw_gutter "$Y_TOP"
+
+  draw_box "$Y_MID" 0 "$LW" "$PH" "CRYPTO" "$C_CRYPTO"
+  draw_box "$Y_MID" "$RX" "$RW" "$PH" "NETWORK" "$C_NET"
+  draw_gutter "$Y_MID"
+
+  draw_box "$Y_BOT" 0 "$COLS" "$PH" "MARKET MICRO-MOVEMENT" "$C_MARKET"
+
+  # Static hints (dim) on content rows only
+  put_at "$T_MSK_R" "$T_MSK_C" "$T_MSK_W" "MSK:" "$C_DIM"
+  put_at "$T_UTC_R" "$T_UTC_C" "$T_UTC_W" "UTC:" "$C_DIM"
+  put_at "$T_BTC_R" "$T_BTC_C" 10 "BTC" "$C_DIM"
+  put_at "$T_ETH_R" "$T_ETH_C" 10 "ETH" "$C_DIM"
+  put_at "$T_RUB_R" "$T_RUB_C" 10 "RUB" "$C_DIM"
+  put_at "$T_IP_R"  "$T_IP_C"  8  "IP" "$C_DIM"
+  put_at "$T_CF_R"  "$T_CF_C"  8  "CF" "$C_DIM"
+  put_at "$T_GG_R"  "$T_GG_C"  8  "GG" "$C_DIM"
+  put_at "$T_RT_R"  "$T_RT_C"  8  "rt" "$C_DIM"
+
+  # Value columns (right of labels)
+  T_MSK_C=$(( T_MSK_C + 5 )); T_MSK_W=$(( T_MSK_W - 5 ))
+  T_UTC_C=$(( T_UTC_C + 5 )); T_UTC_W=$(( T_UTC_W - 5 ))
+  T_BTC_C=$(( T_BTC_C + 11 )); T_BTC_W=$(( T_BTC_W - 11 ))
+  T_ETH_C=$(( T_ETH_C + 11 )); T_ETH_W=$(( T_ETH_W - 11 ))
+  T_RUB_C=$(( T_RUB_C + 11 )); T_RUB_W=$(( T_RUB_W - 11 ))
+  T_IP_C=$(( T_IP_C + 9 ));  T_IP_W=$(( T_IP_W - 9 ))
+  T_CF_C=$(( T_CF_C + 9 ));  T_CF_W=$(( T_CF_W - 9 ))
+  T_GG_C=$(( T_GG_C + 9 ));  T_GG_W=$(( T_GG_W - 9 ))
+  T_RT_C=$(( T_RT_C + 9 ));  T_RT_W=$(( T_RT_W - 9 ))
+
+  put_at "$Y_STATUS" 0 "$COLS" " pulse ${VERSION}  starting…" "$C_DIM"
+}
+
+# ── data ──────────────────────────────────────────────────────────────────────
+fetch_time() {
+  DATA_MSK=$(TZ='Europe/Moscow' date '+%H:%M:%S  %d.%m.%Y' 2>/dev/null || echo 'n/a')
+  DATA_UTC=$(TZ='UTC' date '+%H:%M:%S  %d.%m.%Y' 2>/dev/null || echo 'n/a')
+}
+
+fetch_weather() {
+  local now raw
+  now=$(date +%s 2>/dev/null || echo 0)
+  if [[ -n "$LAST_WEATHER" && $(( now - WEATHER_TS )) -lt 90 ]]; then
+    DATA_WEATHER="$LAST_WEATHER"
+    return
+  fi
+  raw=$(safe_curl -H 'User-Agent: curl' 'wttr.in/Saint_Petersburg?format=3')
+  raw=${raw//$'\r'/}; raw=${raw//$'\n'/ }
+  if [[ -z "$raw" ]]; then
+    DATA_WEATHER='SPB: n/a'
+  else
+    DATA_WEATHER="$raw"
+    LAST_WEATHER="$raw"
+    WEATHER_TS=$now
+  fi
+}
+
+coinbase_spot() {
+  local pair="$1"
+  local json
+  json=$(safe_curl "${COINBASE_SPOT_URL}/${pair}/spot")
+  [[ -n "$json" ]] || return 1
+  printf '%s' "$json" | jq -r '.data.amount // empty' 2>/dev/null
+}
+
+fetch_crypto_batch() {
+  DATA_BTC=$(coinbase_spot 'BTC-USDT' || true)
+  DATA_ETH=$(coinbase_spot 'ETH-USDT' || true)
+  DATA_RUB=$(coinbase_spot 'USDT-RUB' || true)
+}
+
+fmt_price() {
+  # точное форматирование из строки API (без потери через float awk)
+  awk -v p="$1" 'BEGIN{
+    if (p=="" || p=="null") { print "--"; exit }
+    n=p+0
+    if (n>=1000) printf "%.2f", n
+    else if (n>=1) printf "%.4f", n
+    else printf "%.6f", n
+  }'
+}
+
+fetch_ip() {
+  local now
+  now=$(date +%s 2>/dev/null || echo 0)
+  if [[ -n "$LAST_IP" && $(( now - IP_TS )) -lt 45 ]]; then
+    DATA_IP="$LAST_IP"
+    return
+  fi
+  DATA_IP=$(safe_curl 'https://api.ipify.org')
+  DATA_IP=${DATA_IP//[[:space:]]/}
+  [[ -n "$DATA_IP" ]] || DATA_IP='n/a'
+  LAST_IP="$DATA_IP"
+  IP_TS=$now
+}
+
+ping_ms() {
+  local host="$1" out ms
+  out=$(ping -c 1 -W 2 "$host" 2>/dev/null || ping -c 1 -w 2 "$host" 2>/dev/null || true)
+  ms=$(printf '%s' "$out" | awk -F'time[=<]' '/time[=<]/{split($2,a," "); gsub(/ms/,"",a[1]); print a[1]; exit}')
+  [[ -n "$ms" ]] && printf '%.0fms' "$ms" || printf '—'
+}
+
+push_ping_wave() {
+  local ms="$1" level=0 n
+  case "$ms" in
+    *—*|*timeout*) level=0 ;;
+    *)
+      n=$(printf '%s' "$ms" | awk '{gsub(/[^0-9]/,""); print $1+0}')
+      if (( n < 30 )); then level=9
+      elif (( n < 60 )); then level=7
+      elif (( n < 120 )); then level=5
+      elif (( n < 250 )); then level=3
+      else level=1
+      fi
+      ;;
+  esac
+  PING_HIST+="$level"
+  if ((${#PING_HIST} > 20)); then PING_HIST="${PING_HIST: -20}"; fi
+}
+
+wave_chars() {
+  local hist="$1" out="" i c
+  for ((i = 0; i < ${#hist}; i++)); do
+    case "${hist:i:1}" in
+      9) c='█' ;; 8) c='▇' ;; 7) c='▆' ;; 6) c='▅' ;;
+      5) c='▄' ;; 4) c='▃' ;; 3) c='▂' ;; 2) c='▁' ;;
+      *) c='·' ;;
+    esac
+    out+="$c"
+  done
+  [[ -n "$out" ]] || out='··········'
+  printf '%s' "$out"
+}
+
+fetch_network() {
+  fetch_ip
+  DATA_PING_CF=$(ping_ms '1.1.1.1')
+  DATA_PING_GG=$(ping_ms 'google.com')
+  push_ping_wave "$DATA_PING_CF"
+  push_ping_wave "$DATA_PING_GG"
+  DATA_ROUTE_WAVE=$(wave_chars "$PING_HIST")
+}
+
+pct_change() {
+  awk -v c="$1" -v p="$2" 'BEGIN{
+    if (p=="" || p+0==0 || c=="") { printf "0.00"; exit }
+    printf "%.2f", (c-p)/p*100
+  }'
+}
+
+momentum_line() {
+  local sym="$1" cur="$2" prev="$3" pct arrow sign
+  [[ -n "$cur" && "$cur" != "null" ]] || { printf '%s: n/a' "$sym"; return; }
+  pct=$(pct_change "$cur" "$prev")
+  if [[ -z "$prev" ]]; then
+    arrow='→'; pct='0.00'
+  else
+    arrow=$(awk -v p="$pct" 'BEGIN{
+      if (p>0.02) print "↑"; else if (p<-0.02) print "↓"; else print "→"
+    }')
+  fi
+  if awk -v p="$pct" 'BEGIN{exit(!(p>=0))}'; then
+    printf '%s: %s +%s%% (%s)' "$sym" "$arrow" "$pct" "$REFRESH_LABEL"
+  else
+    printf '%s: %s %s%% (%s)' "$sym" "$arrow" "$pct" "$REFRESH_LABEL"
+  fi
+}
+
+spark_char() {
+  awk -v x="$1" 'BEGIN{
+    if (x<-0.15) print "▁"; else if (x<-0.05) print "▂";
+    else if (x<0.05) print "▃"; else if (x<0.15) print "▅"; else print "▇"
+  }'
+}
+
+update_market_history() {
+  local btc_pct="$1" vol_sample abs_pct bars="" part c max=14
+  SPARK_HIST+="${btc_pct}|"
+  while ((${#SPARK_HIST} > 200)); do SPARK_HIST="${SPARK_HIST#*|}"; done
+  abs_pct=$(awk -v p="$btc_pct" 'BEGIN{printf "%.4f", (p<0)?-p:p}')
+  vol_sample=$(awk -v a="$abs_pct" 'BEGIN{
+    if (a<0.01) print 1; else if (a<0.03) print 3; else if (a<0.08) print 5;
+    else if (a<0.15) print 7; else print 9
+  }')
+  VOL_HIST+="$vol_sample"
+  if ((${#VOL_HIST} > max)); then VOL_HIST="${VOL_HIST: -max}"; fi
+  DATA_VOL="VOL  $(wave_chars "$VOL_HIST")"
+  for part in ${SPARK_HIST//|/}; do
+    [[ -z "$part" ]] && continue
+    bars+="$(spark_char "$part")"
+  done
+  if ((${#bars} > T_SP_W - 7)); then bars="${bars: -$((T_SP_W - 7))}"; fi
+  [[ -n "$bars" ]] || bars='▃▃▃▃▃▃'
+  DATA_SPARK="BTC ${bars}"
+}
+
+compute_market_micro() {
+  local btc_pct
+  DATA_BTC_MOM=$(momentum_line 'BTC' "$DATA_BTC" "$PREV_BTC")
+  DATA_ETH_MOM=$(momentum_line 'ETH' "$DATA_ETH" "$PREV_ETH")
+  if [[ -n "$DATA_BTC" && -n "$PREV_BTC" ]]; then
+    btc_pct=$(pct_change "$DATA_BTC" "$PREV_BTC")
+  else
+    btc_pct="0"
+  fi
+  update_market_history "$btc_pct"
+}
+
+fetch_all() {
+  fetch_time
+  fetch_weather
+  fetch_crypto_batch
+  fetch_network
+  compute_market_micro
+}
+
+# ── partial updates ───────────────────────────────────────────────────────────
+draw_time() {
+  put_at "$T_MSK_R" "$T_MSK_C" "$T_MSK_W" "$DATA_MSK" "$C_TIME"
+  put_at "$T_UTC_R" "$T_UTC_C" "$T_UTC_W" "$DATA_UTC" "$C_TIME"
+}
+
+draw_weather() {
+  put_at "$T_WX_R" "$T_WX_C" "$T_WX_W" "$DATA_WEATHER" "$C_WEATHER"
+  put_at "$T_WX_R2" "$T_WX_C" "$T_WX_W" "" "$C_WEATHER"
+}
+
+draw_crypto() {
+  put_at "$T_BTC_R" "$T_BTC_C" "$T_BTC_W" "$(fmt_price "$DATA_BTC")" "$C_CRYPTO"
+  put_at "$T_ETH_R" "$T_ETH_C" "$T_ETH_W" "$(fmt_price "$DATA_ETH")" "$C_CRYPTO"
+  put_at "$T_RUB_R" "$T_RUB_C" "$T_RUB_W" "$(fmt_price "$DATA_RUB")" "$C_CRYPTO"
+}
+
+draw_network() {
+  put_at "$T_IP_R" "$T_IP_C" "$T_IP_W" "$DATA_IP" "$C_NET"
+  put_at "$T_CF_R" "$T_CF_C" "$T_CF_W" "$DATA_PING_CF" "$C_NET"
+  put_at "$T_GG_R" "$T_GG_C" "$T_GG_W" "$DATA_PING_GG" "$C_NET"
+  put_at "$T_RT_R" "$T_RT_C" "$T_RT_W" "$DATA_ROUTE_WAVE" "$C_NET"
+}
+
+draw_market_micro_movement() {
+  put_at "$T_BM_R" "$T_BM_C" "$T_BM_W" "$DATA_BTC_MOM" "$C_MARKET"
+  put_at "$T_EM_R" "$T_EM_C" "$T_EM_W" "$DATA_ETH_MOM" "$C_MARKET"
+  put_at "$T_VO_R" "$T_VO_C" "$T_VO_W" "$DATA_VOL" "$C_MARKET"
+  put_at "$T_SP_R" "$T_SP_C" "$T_SP_W" "$DATA_SPARK" "$C_MARKET"
+}
+
+draw_status() {
+  put_at "$Y_STATUS" 0 "$COLS" \
+    " pulse ${VERSION}  ${COLS}×${LINES}  ${LOOP_INTERVAL}s  $(date '+%H:%M:%S')  Ctrl+C" "$C_DIM"
+}
+
+update_all_fields() {
+  draw_time
+  draw_weather
+  draw_crypto
+  draw_network
+  draw_market_micro_movement
+  draw_status
+}
+
+advance_prev_prices() {
+  [[ -n "$DATA_BTC" ]] && PREV_BTC="$DATA_BTC"
+  [[ -n "$DATA_ETH" ]] && PREV_ETH="$DATA_ETH"
+}
+
+tui_enter() {
+  printf '\033[?1049h\033[?25l'
+  tput clear 2>/dev/null || printf '\033[H\033[2J'
+}
+
+tui_leave() { printf '\033[?25h\033[?1049l'; }
+
+usage() {
+  cat <<EOF
+pulse v${VERSION} — fixed-grid TUI
+
+  ./pulse          loop (${REFRESH_SEC}s)
+  ./pulse 4        interval 2–5s
+  PULSE_INTERVAL=5 ./pulse
+
+Min terminal: 80×24
+EOF
+}
+
+main() {
+  LOOP_INTERVAL="$REFRESH_SEC"
+  case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    '') ;;
+    *)
+      [[ "${1}" =~ ^[0-9]+$ ]] || { echo "Unknown: $1" >&2; usage; exit 1; }
+      LOOP_INTERVAL="$1"
+      ;;
+  esac
+
+  require_deps
+  init_geometry
+  tui_enter
+  trap 'tui_leave; exit 0' INT TERM EXIT
+
+  draw_grid_frame
+
+  [[ "$LOOP_INTERVAL" =~ ^[0-9]+$ ]] || LOOP_INTERVAL=5
+  if (( LOOP_INTERVAL < 2 )); then LOOP_INTERVAL=2; fi
+  if (( LOOP_INTERVAL > 5 )); then LOOP_INTERVAL=5; fi
+  REFRESH_LABEL="${LOOP_INTERVAL}s"
+
+  while true; do
+    fetch_all
+    update_all_fields
+    advance_prev_prices
+    sleep "$LOOP_INTERVAL"
+  done
+}
+
+main "$@"
